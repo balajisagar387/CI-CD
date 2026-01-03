@@ -1,0 +1,99 @@
+pipeline {
+
+    agent any
+
+    tools {
+        maven 'Maven-3.6.3'
+        jdk 'JDK-17'
+    }
+   environment {
+        APP_NAME = 'MyApp'
+        aws_REGION = 'us-east-1'
+        AWS_ACCOUNT_ID = ''
+        ECR_REPO = "${AWS_ACCOUNT_ID}.dkr.ecr.${aws_REGION}.amazonaws.com/${APP_NAME}"
+        IMAGE_TAG = "${ECR_REPO}:${BUILD_NUMBER}"
+        SONARQUBE_PROJECT = "JAVA APP"
+        SONARQUBE_ENV = 'SonarQube-Env'
+
+        SLACK_CHANNEL = '#DEPLOYMENT'
+   }
+   stages {
+    stage('build') {
+        steps {
+            echo 'Building..'
+            sh 'mvn clean package -DskipTests=true'
+        }
+
+    stage('SonarQube Analysis') {
+        steps {
+            echo 'SonarQube Analysis..'
+            withSonarQubeEnv(SONARQUBE_ENV) {
+                sh "mvn sonar:sonar -Dsonar.projectKey=${SONARQUBE_PROJECT} -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_AUTH_TOKEN"
+            }
+        }
+    }
+    stage('Quality Gate') {
+        steps {
+            echo 'Checking Quality Gate..'
+            timeout(time: 5, unit: 'MINUTES') {
+                waitForQualityGate abortPipeline: true
+            }
+        }
+    }
+    stage('Docker Build') {
+        steps {
+            echo 'Building Docker Image..'
+            sh "docker build -t ${IMAGE_TAG} ."
+        }
+    }
+   }
+   stage('Trivy Scan') {
+        steps {
+            echo 'Scanning Docker Image with Trivy..'
+            sh "trivy image --exit-code 1 --severity HIGH,CRITICAL ${IMAGE_TAG}"
+        }
+    }
+    stage('Push to ECR') {
+        steps {
+            withAWS(region: "${aws_REGION}", credentials: 'aws-credentials-id') {
+                echo 'Pushing Docker Image to ECR..'
+                sh '''
+                    aws ecr get-login-password --region ${aws_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${aws_REGION}.amazonaws.com
+                    docker push ${IMAGE_TAG}
+                '''
+            }
+    stage('Deploy to eks') {
+        steps {
+            echo 'Deploying to EKS..'
+            sh '''
+                  aws eks update-kubeconfig --region ${AWS_REGION} --name eks-cluster-name
+
+                  sed -i 's|IMAGE_TAG|${IMAGE_TAG}|g' k8s/deployment.yaml
+
+                  kubectl apply -f k8s/deployment.yaml
+                  kubectl apply -f k8s/service.yaml
+            '''
+        }
+    }
+
+    post {
+        success {
+            emailext(
+                subject: "Build Successful: ${currentBuild.fullDisplayName}",
+                body: "The build was successful. Check the details at ${env.BUILD_URL}",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+                to: "devops@gmail.com"
+            )
+            slackSend(channel: "${SLACK_CHANNEL}", color: 'good', message: "Build Successful: ${currentBuild.fullDisplayName} - ${env.BUILD_URL}")
+        }
+        failure {
+            emailext(
+                subject: "Build Failed: ${currentBuild.fullDisplayName}",
+                body: "The build has failed. Check the details at ${env.BUILD_URL}",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+                to: "devops@gmail.com"
+            )
+            slackSend(channel: "${SLACK_CHANNEL}", color: 'danger', message: "Build Failed: ${currentBuild.fullDisplayName} - ${env.BUILD_URL}")
+        }   
+    }
+}    
